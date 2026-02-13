@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "can.h"
+#include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -102,6 +104,8 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_I2C1_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
   
 	shell.read = myShellRead;
@@ -113,6 +117,9 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   uint32_t shellTick = HAL_GetTick();
+	
+	
+	
   while (1)
   {
     /* USER CODE END WHILE */

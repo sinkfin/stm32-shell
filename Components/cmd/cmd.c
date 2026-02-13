@@ -2,6 +2,7 @@
 #include "shell.h"
 #include "stdio.h"
 #include "gpio.h"
+#include "i2c.h"
 
 void func(int i, char ch, char *str)
 {
@@ -34,7 +35,6 @@ void led(int state)
 }
 
 SHELL_EXPORT_CMD(led, led, set led state);
-
 
 int var1 = 123;
 SHELL_EXPORT_VAR_INT(var1, var1, var for test);
