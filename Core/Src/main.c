@@ -18,8 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
 #include "can.h"
+#include "dac.h"
+#include "dma.h"
 #include "i2c.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -27,6 +31,8 @@
 /* USER CODE BEGIN Includes */
 #include "ring.h"
 #include "shell.h"
+#include "stdio.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,6 +42,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define ADC1_DMA_BUF_SIZE 1024
 
 /* USER CODE END PD */
 
@@ -50,6 +57,12 @@
 ring uart_rx_ring;
 char ring_buf[512];
 SHELL_TypeDef shell;
+uint16_t adc1_dma_buf[ADC1_DMA_BUF_SIZE];
+uint16_t dac1_dma_buf[ADC1_DMA_BUF_SIZE];
+volatile uint8_t adc1_dma_half_ready = 0;
+volatile uint8_t adc1_dma_full_ready = 0;
+volatile uint8_t dac1_dma_half_ready = 1;
+volatile uint8_t dac1_dma_full_ready = 1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,7 +75,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 signed char myShellRead(char *c)
 {
-	if (ring_poll(&uart_rx_ring, c) == 0) //�ӻ��λ�����������
+	if (ring_poll(&uart_rx_ring, c) == 0)
 		return 0;
 	else
 		return -1;
@@ -71,6 +84,38 @@ signed char myShellRead(char *c)
 void myShellWrite(const char c)
 {
 	HAL_UART_Transmit(&huart1, (uint8_t *)&c, 1, 1000);
+}
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    adc1_dma_half_ready = 1;
+  }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    adc1_dma_full_ready = 1;
+  }
+}
+
+void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac)
+{
+  if (hdac->Instance == DAC)
+  {
+    dac1_dma_half_ready = 1;
+  }
+}
+
+void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
+{
+  if (hdac->Instance == DAC)
+  {
+    dac1_dma_full_ready = 1;
+  }
 }
 /* USER CODE END 0 */
 
@@ -103,23 +148,42 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
   MX_CAN1_Init();
+  MX_ADC1_Init();
+  MX_DAC_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   
 	shell.read = myShellRead;
 	shell.write = myShellWrite;
 	shellInit(&shell);
+
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc1_dma_buf, ADC1_DMA_BUF_SIZE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  memset(dac1_dma_buf, 0, sizeof(dac1_dma_buf));
+
+  if (HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t *)dac1_dma_buf, ADC1_DMA_BUF_SIZE, DAC_ALIGN_12B_R) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 	
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   uint32_t shellTick = HAL_GetTick();
-	
-	
-	
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -129,6 +193,24 @@ int main(void)
     {
       shellTick = HAL_GetTick();
       shellTask(&shell);
+    }
+
+    if (adc1_dma_half_ready && dac1_dma_half_ready)
+    {
+      adc1_dma_half_ready = 0;
+      dac1_dma_half_ready = 0;
+      //可以做一些数据处理，这里直接复制buffer
+      memcpy((void *)&dac1_dma_buf[0], (void *)&adc1_dma_buf[0], (ADC1_DMA_BUF_SIZE / 2) * sizeof(uint16_t));
+    }
+
+    if (adc1_dma_full_ready && dac1_dma_full_ready)
+    {
+      adc1_dma_full_ready = 0;
+      dac1_dma_full_ready = 0;
+      //可以做一些数据处理，这里直接复制buffer
+      memcpy((void *)&dac1_dma_buf[ADC1_DMA_BUF_SIZE / 2],
+            (void *)&adc1_dma_buf[ADC1_DMA_BUF_SIZE / 2],
+            (ADC1_DMA_BUF_SIZE / 2) * sizeof(uint16_t));
     }
   }
   /* USER CODE END 3 */
