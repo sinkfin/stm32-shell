@@ -1,0 +1,691 @@
+name: Build xaga rootfs.img
+
+# Arch Linux ARM (aarch64) rootfs 构建工作流
+# 产出可直接 `fastboot flash userdata rootfs.img` 的 ext4 镜像
+#
+# 性能关键：不做 qemu 模拟下的 pacman -Syu。
+# 改用宿主机 x86_64 pacman 直接向 arm64 目标 root 安装（Architecture = aarch64），
+# 避免 qemu-user 下 gpg/zstd 解包慢几十倍的问题。
+# 只有最后写用户/密码等极小操作才进 chroot。
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_size_gb:
+        description: '镜像总大小 (GB)，刷入后可用 resize2fs 扩展'
+        required: true
+        default: '6'
+        type: string
+      arch_tarball_url:
+        description: 'Arch Linux ARM aarch64 rootfs tarball 地址'
+        required: true
+        default: 'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz'
+        type: string
+      hostname:
+        description: '设备主机名'
+        required: true
+        default: 'xaga'
+        type: string
+      username:
+        description: '普通用户名'
+        required: true
+        default: 'alarm'
+        type: string
+      user_password:
+        description: '普通用户密码'
+        required: true
+        default: 'alarm'
+        type: string
+      root_password:
+        description: 'root 密码'
+        required: true
+        default: 'root'
+        type: string
+      extra_packages:
+        description: '额外安装的包（空格分隔）'
+        required: false
+        default: ''
+        type: string
+      desktop:
+        description: '图形界面（可选，影响构建耗时与镜像大小）'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - 'none'
+          - 'phosh'
+          - 'sway'
+          - 'plasma-mobile'
+      wifi_ssid:
+        description: '预置 WiFi SSID（留空则不预置）'
+        required: false
+        default: ''
+        type: string
+      wifi_password:
+        description: '预置 WiFi 密码'
+        required: false
+        default: ''
+        type: string
+      create_release:
+        description: '生成 GitHub Release（永久资源）'
+        required: true
+        default: true
+        type: boolean
+
+  push:
+    tags:
+      - 'rootfs-v*'
+
+permissions:
+  contents: write
+
+env:
+  # Arch Linux ARM 签名密钥
+  ALARM_KEY: '68B3537F39A313B3E574D06777193F152BDBE6A6'
+
+jobs:
+  build:
+    name: Build Arch Linux ARM rootfs.img
+    # 构建 rootfs 需要写 /usr/bin/pacman 的 RootDir 等，
+    # 用 ubuntu-24.04 即可（不要去用 arm64 runner，Actions 不免费）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. 解析输入（push tag 时 inputs 全为空，需要兜底）
+      # ---------------------------------------------------------------
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          set -e
+          IMG_SIZE="${{ github.event.inputs.image_size_gb }}"
+          [ -z "$IMG_SIZE" ] && IMG_SIZE="6"
+
+          TARBALL="${{ github.event.inputs.arch_tarball_url }}"
+          [ -z "$TARBALL" ] && TARBALL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+
+          HOSTNAME_IN="${{ github.event.inputs.hostname }}"
+          [ -z "$HOSTNAME_IN" ] && HOSTNAME_IN="xaga"
+
+          USERNAME_IN="${{ github.event.inputs.username }}"
+          [ -z "$USERNAME_IN" ] && USERNAME_IN="alarm"
+
+          USER_PW="${{ github.event.inputs.user_password }}"
+          [ -z "$USER_PW" ] && USER_PW="alarm"
+
+          ROOT_PW="${{ github.event.inputs.root_password }}"
+          [ -z "$ROOT_PW" ] && ROOT_PW="root"
+
+          DESKTOP="${{ github.event.inputs.desktop }}"
+          [ -z "$DESKTOP" ] && DESKTOP="none"
+
+          {
+            echo "img_size=$IMG_SIZE"
+            echo "tarball=$TARBALL"
+            echo "hostname=$HOSTNAME_IN"
+            echo "username=$USERNAME_IN"
+            echo "desktop=$DESKTOP"
+          } >> $GITHUB_OUTPUT
+
+          echo "镜像大小 : ${IMG_SIZE}GB"
+          echo "主机名   : $HOSTNAME_IN"
+          echo "桌面     : $DESKTOP"
+
+      # ---------------------------------------------------------------
+      # 2. QEMU binfmt（仅最后 chroot 写密码时用到）
+      # ---------------------------------------------------------------
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            arch-install-scripts \
+            qemu-user-static binfmt-support \
+            bsdtar libarchive-tools \
+            e2fsprogs util-linux \
+            curl wget gnupg ca-certificates
+
+          echo "=== 校验 binfmt ==="
+          ls /proc/sys/fs/binfmt_misc/ || true
+          echo "=== pacman 版本 ==="
+          pacman --version 2>/dev/null | head -2 || echo "宿主无 pacman，将使用 chroot 方式"
+
+      # ---------------------------------------------------------------
+      # 3. 下载并校验 ALARM rootfs
+      # ---------------------------------------------------------------
+      - name: Download and verify ArchLinuxARM tarball
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+
+          TB="${{ steps.meta.outputs.tarball }}"
+          echo "下载: $TB"
+          for i in 1 2 3; do
+            wget -q --show-progress -O alarm.tar.gz "$TB" && break
+            echo "第 $i 次失败，重试..."; sleep 10
+          done
+          test -s alarm.tar.gz || { echo "::error::下载失败"; exit 1; }
+          ls -lh alarm.tar.gz
+
+          echo "=== 尝试校验 PGP 签名 ==="
+          if wget -q -O alarm.tar.gz.sig "${TB}.sig"; then
+            gpg --keyserver keyserver.ubuntu.com --recv-keys "$ALARM_KEY" || true
+            if gpg --verify alarm.tar.gz.sig alarm.tar.gz; then
+              echo "✅ 签名校验通过"
+            else
+              echo "::warning::签名校验未通过（可能是 http 源未提供 sig），继续"
+            fi
+          else
+            echo "::warning::未取得 .sig 文件，跳过签名校验"
+          fi
+
+          echo "=== 记录 tarball 校验和 ==="
+          sha256sum alarm.tar.gz | tee alarm.tar.gz.sha256
+
+      # ---------------------------------------------------------------
+      # 4. 解包
+      # ---------------------------------------------------------------
+      - name: Extract rootfs
+        run: |
+          set -e
+          cd work
+          mkdir -p rootfs
+          # 必须用 bsdtar 保留 xattr / ACL
+          sudo bsdtar -xpf alarm.tar.gz -C rootfs
+          echo "=== 解包结果 ==="
+          ls rootfs/
+          du -sh rootfs/
+
+      # ---------------------------------------------------------------
+      # 5. 清理 ALARM 自带引导（与主线内核冲突）
+      # ---------------------------------------------------------------
+      - name: Strip conflicting boot files
+        run: |
+          set -e
+          cd work/rootfs
+
+          echo "=== 删除前 ==="
+          ls -la boot/ 2>/dev/null || true
+
+          # ALARM 自带内核与引导配置，全部移除
+          sudo rm -f  boot/Image boot/Image.gz
+          sudo rm -rf boot/dtbs
+          sudo rm -rf boot/extlinux
+          sudo rm -f  etc/fstab
+
+          # 保留 boot 目录本身（内核挂载点）
+          sudo mkdir -p boot
+
+          echo "=== 删除后 ==="
+          ls -la boot/
+
+      # ---------------------------------------------------------------
+      # 6. 配置 pacman 源（在国内 runner 上会快很多，但 Actions 在海外，
+      #    所以这里保留官方源 + 加 ustc 作为备用）
+      # ---------------------------------------------------------------
+      - name: Configure pacman mirrors
+        run: |
+          set -e
+          cd work/rootfs
+
+          sudo tee etc/pacman.d/mirrorlist > /dev/null <<'EOF'
+          ## Arch Linux ARM
+          Server = http://mirror.archlinuxarm.org/$arch/$repo
+          Server = https://mirrors.ustc.edu.cn/archlinuxarm/$arch/$repo
+          Server = https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/$arch/$repo
+          EOF
+
+          echo "=== mirrorlist ==="
+          cat etc/pacman.d/mirrorlist
+          echo "=== pacman.conf Architecture ==="
+          grep -E '^Architecture' etc/pacman.conf || echo "Architecture 未显式设置"
+
+      # ---------------------------------------------------------------
+      # 7. 交叉安装包（核心性能优化）
+      #
+      # ubuntu runner 上没有 pacman（arch-install-scripts 不含它）。
+      # 用官方 Arch Linux Docker 镜像跑宿主机 pacman，通过 RootDir 直接
+      # 向 arm64 目标 root 装包 —— 完全绕开 qemu 模拟，比 chroot 内
+      # pacman -Syu 快一个数量级。
+      # ---------------------------------------------------------------
+      - name: Cross-install packages via Arch container pacman
+        run: |
+          set -e
+          cd work
+          ROOT="$PWD/rootfs"
+          PKGCACHE="$PWD/pkgcache"
+          mkdir -p "$PKGCACHE"
+
+          # 生成供容器内使用的 pacman 配置（RootDir 指向宿主路径）
+          cat > pacman-cross.conf <<EOF
+          [options]
+          RootDir   = $ROOT
+          DBPath    = $ROOT/var/lib/pacman/
+          CacheDir  = $PKGCACHE/
+          LogFile   = $ROOT/var/log/pacman.log
+          GPGDir    = $ROOT/etc/pacman.d/gnupg/
+          HookDir   = $ROOT/etc/pacman.d/hooks/
+          Architecture = aarch64
+          SigLevel  = Never
+
+          [core]
+          Server = http://mirror.archlinuxarm.org/\$arch/\$repo
+          Server = https://mirrors.ustc.edu.cn/archlinuxarm/\$arch/\$repo
+
+          [extra]
+          Server = http://mirror.archlinuxarm.org/\$arch/\$repo
+          Server = https://mirrors.ustc.edu.cn/archlinuxarm/\$arch/\$repo
+
+          [alarm]
+          Server = http://mirror.archlinuxarm.org/\$arch/\$repo
+          Server = https://mirrors.ustc.edu.cn/archlinuxarm/\$arch/\$repo
+          EOF
+
+          chmod 644 pacman-cross.conf
+
+          # 拉官方 Arch 镜像（含 pacman 与必要工具）
+          docker pull archlinux:latest
+
+          echo "=== 同步数据库 ==="
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            archlinux:latest \
+            bash -c "pacman -Sy --config /work/pacman-cross.conf --noconfirm"
+
+          echo "=== 安装基础包与密钥环 ==="
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            archlinux:latest \
+            bash -c "pacman -S --config /work/pacman-cross.conf --noconfirm --needed base archlinuxarm-keyring"
+
+          echo "✅ 宿主容器 pacman 安装完成"
+
+          # 记录目标包列表，供下一步复用
+          echo "PACMAN_MODE=container" >> $GITHUB_ENV
+
+      - name: Install packages inside chroot (fallback)
+        if: env.PACMAN_MODE == ''
+        run: |
+          set -e
+          cd work
+          ROOT="$PWD/rootfs"
+
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/" || true
+          sudo cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+
+          sudo mount --bind /proc "$ROOT/proc"
+          sudo mount --bind /sys "$ROOT/sys"
+          sudo mount --bind /dev "$ROOT/dev"
+          sudo mount --bind /dev/pts "$ROOT/dev/pts"
+
+          sudo chroot "$ROOT" /bin/bash -c "
+            set -e
+            pacman-key --init
+            pacman-key --populate archlinuxarm
+            pacman -Syu --noconfirm
+            pacman -S --noconfirm --needed base archlinuxarm-keyring
+          "
+
+          sudo umount -R "$ROOT/dev" "$ROOT/sys" "$ROOT/proc" || true
+          echo "PACMAN_MODE=chroot" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------
+      # 8. 安装目标包（音频/网络/桌面等）
+      # ---------------------------------------------------------------
+      - name: Install target packages
+        run: |
+          set -e
+          cd work
+          ROOT="$PWD/rootfs"
+
+          # 基础必需包 —— 注意：不装 linux-aarch64（我们用自己编的主线内核）
+          BASE_PKGS="alsa-ucm-conf alsa-utils \
+                     networkmanager openssh sudo nano vim \
+                     bluez bluez-utils haveged \
+                     dosfstools e2fsprogs"
+
+          DESKTOP_PKGS=""
+          case "${{ steps.meta.outputs.desktop }}" in
+            phosh)         DESKTOP_PKGS="phosh phoc squeekboard gnome-console" ;;
+            sway)          DESKTOP_PKGS="sway swaybg foot waybar" ;;
+            plasma-mobile) DESKTOP_PKGS="plasma-mobile plasma-nm" ;;
+            *)             DESKTOP_PKGS="" ;;
+          esac
+
+          EXTRA="${{ github.event.inputs.extra_packages }}"
+
+          ALL="$BASE_PKGS $DESKTOP_PKGS $EXTRA"
+          echo "将安装: $ALL"
+
+          if [ "$PACMAN_MODE" = "container" ]; then
+            docker run --rm \
+              -v "$PWD:/work" \
+              -w /work \
+              archlinux:latest \
+              bash -c "pacman -S --config /work/pacman-cross.conf --noconfirm --needed $ALL"
+          else
+            sudo cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/" 2>/dev/null || true
+            sudo cp /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
+            sudo mount --bind /proc "$ROOT/proc" 2>/dev/null || true
+            sudo mount --bind /sys "$ROOT/sys" 2>/dev/null || true
+            sudo mount --bind /dev "$ROOT/dev" 2>/dev/null || true
+            sudo chroot "$ROOT" /bin/bash -c "pacman -S --noconfirm --needed $ALL"
+            sudo umount -R "$ROOT/dev" "$ROOT/sys" "$ROOT/proc" 2>/dev/null || true
+          fi
+
+          echo "✅ 目标包安装完成"
+
+      # ---------------------------------------------------------------
+      # 9. 初始化密钥环 + 系统配置（chroot，qemu 下操作量很小）
+      # ---------------------------------------------------------------
+      - name: Configure system inside chroot
+        run: |
+          set -e
+          cd work
+          ROOT="$PWD/rootfs"
+
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/" 2>/dev/null || true
+          sudo cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+          sudo mount --bind /proc "$ROOT/proc" 2>/dev/null || true
+          sudo mount --bind /sys "$ROOT/sys" 2>/dev/null || true
+          sudo mount --bind /dev "$ROOT/dev" 2>/dev/null || true
+          sudo mount --bind /dev/pts "$ROOT/dev/pts" 2>/dev/null || true
+
+          sudo chroot "$ROOT" /bin/bash -c '
+            set -e
+
+            echo "=== 初始化 pacman keyring ==="
+            pacman-key --init
+            pacman-key --populate archlinuxarm
+
+            echo "=== 主机名 ==="
+            echo "${{ steps.meta.outputs.hostname }}" > /etc/hostname
+
+            echo "=== 时区 ==="
+            ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+            echo "=== locale ==="
+            echo "en_US.UTF-8 UTF-8"  > /etc/locale.gen
+            echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen
+            locale-gen
+            echo "LANG=en_US.UTF-8" > /etc/locale.conf
+
+            echo "=== root 密码 ==="
+            echo "root:${{ github.event.inputs.root_password || 'root' }}" | chpasswd
+
+            echo "=== 普通用户 ==="
+            U="${{ steps.meta.outputs.username }}"
+            if ! id "$U" >/dev/null 2>&1; then
+              useradd -m -G wheel,audio,video,render,network,storage -s /bin/bash "$U"
+            fi
+            echo "$U:${{ github.event.inputs.user_password || 'alarm' }}" | chpasswd
+
+            echo "=== sudo 免密（谨慎，仅调试期建议） ==="
+            echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
+
+            echo "=== 启用服务 ==="
+            systemctl enable NetworkManager sshd haveged
+            systemctl enable systemd-timesyncd
+
+            echo "=== 禁用不需要的服务 ==="
+            systemctl disable systemd-networkd 2>/dev/null || true
+
+            echo "=== 清理 pacman 缓存 ==="
+            pacman -Scc --noconfirm || true
+          '
+
+          echo "=== wall ==="
+          sudo chroot "$ROOT" /bin/bash -c 'echo "--- passwd ---"; cat /etc/passwd | tail -5'
+
+          sudo umount -R "$ROOT/dev" "$ROOT/sys" "$ROOT/proc" 2>/dev/null || true
+          sudo rm -f "$ROOT/usr/bin/qemu-aarch64-static"
+
+      # ---------------------------------------------------------------
+      # 10. 预置 WiFi（避免首次开机无法登录）
+      # ---------------------------------------------------------------
+      - name: Preconfigure WiFi
+        if: github.event.inputs.wifi_ssid != ''
+        run: |
+          set -e
+          cd work/rootfs
+
+          SSID="${{ github.event.inputs.wifi_ssid }}"
+          PSK="${{ github.event.inputs.wifi_password }}"
+
+          sudo mkdir -p etc/NetworkManager/system-connections
+          sudo tee etc/NetworkManager/system-connections/xaga-wifi.nmconnection > /dev/null <<EOF
+          [connection]
+          id=xaga-wifi
+          type=wifi
+          autoconnect=true
+
+          [wifi]
+          mode=infrastructure
+          ssid=${SSID}
+
+          [wifi-security]
+          key-mgmt=wpa-psk
+          psk=${PSK}
+
+          [ipv4]
+          method=auto
+
+          [ipv6]
+          method=auto
+          EOF
+
+          sudo chmod 600 etc/NetworkManager/system-connections/xaga-wifi.nmconnection
+          echo "✅ WiFi 已预置: $SSID"
+
+      # ---------------------------------------------------------------
+      # 11. 打包 ext4 镜像
+      # ---------------------------------------------------------------
+      - name: Pack rootfs.img
+        run: |
+          set -e
+          cd work
+          mkdir -p ../out
+
+          SIZE_GB="${{ steps.meta.outputs.img_size }}"
+          IMG="../out/rootfs.img"
+
+          echo "=== 创建 ${SIZE_GB}GB 镜像 ==="
+          dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE_GB * 1024)) status=progress
+
+          echo "=== 格式化为 ext4 ==="
+          # 关闭 metadata_csum_seed，避免部分老内核不认识
+          mkfs.ext4 -L rootfs -O ^metadata_csum_seed -m 1 "$IMG"
+
+          echo "=== 写入文件系统 ==="
+          mkdir -p mnt
+          sudo mount -o loop "$IMG" mnt
+          # 用 rsync 而非 cp -a，处理设备节点更稳
+          sudo rsync -aHAX --numeric-ids ./rootfs/ mnt/
+          echo "--- 内容抽查 ---"
+          ls mnt/
+          sudo umount mnt
+
+          echo "=== 镜像信息 ==="
+          ls -lh "$IMG"
+          file "$IMG"
+          echo "--- e2fsck 检查 ---"
+          sudo e2fsck -f -n "$IMG" || echo "::warning::e2fsck 有输出，请检查"
+
+      # ---------------------------------------------------------------
+      # 12. 生成校验和与说明
+      # ---------------------------------------------------------------
+      - name: Generate checksums and readme
+        run: |
+          set -e
+          cd out
+          sha256sum rootfs.img > rootfs.img.sha256
+
+          cat > README.txt <<EOF
+          ============================================================
+           xaga (Redmi Note 11T Pro) Arch Linux ARM rootfs.img
+          ============================================================
+          构建时间  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          来源      : ${{ steps.meta.outputs.tarball }}
+          Run       : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          --- 系统配置 ---
+          主机名    : ${{ steps.meta.outputs.hostname }}
+          用户名    : ${{ steps.meta.outputs.username }}
+          桌面      : ${{ steps.meta.outputs.desktop }}
+          镜像大小  : ${{ steps.meta.outputs.img_size }}GB
+          安装方式  : ${PACMAN_MODE}
+
+          --- 默认凭据（请立即修改）---
+          root      : ${{ github.event.inputs.root_password || 'root' }}
+          ${{ steps.meta.outputs.username }}      : ${{ github.event.inputs.user_password || 'alarm' }}
+
+          --- 刷入 ---
+          1. 手机进入 fastboot：关机后按住 电源 + 音量减
+          2. fastboot flash userdata rootfs.img
+          3. fastboot reboot
+
+          --- 扩容到全盘（刷入后首次开机，在设备上执行）---
+          # 确认 userdata 分区设备节点（xaga 上通常是 /dev/sdc86）
+          ls -l /dev/disk/by-partlabel/userdata
+          resize2fs /dev/disk/by-partlabel/userdata
+
+          --- 校验 ---
+          sha256sum -c rootfs.img.sha256
+          ============================================================
+          EOF
+
+          ls -lh
+          echo ""
+          cat README.txt
+
+      # ---------------------------------------------------------------
+      # 13. 上传 Artifacts
+      # ---------------------------------------------------------------
+      - name: Upload rootfs.img as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xaga-rootfs-${{ steps.meta.outputs.desktop }}-${{ github.run_number }}
+          path: |
+            out/rootfs.img
+            out/rootfs.img.sha256
+            out/README.txt
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0   # ext4 已压缩过，再压无意义且极慢
+
+      # ---------------------------------------------------------------
+      # 14. 发布 Release
+      # ---------------------------------------------------------------
+      - name: Compute release tag
+        if: |
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          github.event.inputs.create_release == 'true'
+        id: tag
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            OUT_TAG="${{ github.ref_name }}"
+          else
+            OUT_TAG="rootfs-${{ steps.meta.outputs.desktop }}-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          fi
+          echo "out_tag=$OUT_TAG" >> $GITHUB_OUTPUT
+          echo "release tag = $OUT_TAG"
+
+      - name: Create or update Release
+        if: |
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.out_tag }}
+          name: ${{ steps.tag.outputs.out_tag }}
+          body: |
+            ## xaga Arch Linux ARM rootfs.img
+
+            | 项目 | 值 |
+            |---|---|
+            | 桌面环境 | `${{ steps.meta.outputs.desktop }}` |
+            | 镜像大小 | `${{ steps.meta.outputs.img_size }} GB` |
+            | 主机名 | `${{ steps.meta.outputs.hostname }}` |
+            | 用户名 | `${{ steps.meta.outputs.username }}` |
+
+            ### 刷入
+
+            ```bash
+            # 进入 fastboot：关机后按住 电源 + 音量减
+            fastboot flash userdata rootfs.img
+            fastboot reboot
+            ```
+
+            ### 校验
+
+            ```bash
+            sha256sum -c rootfs.img.sha256
+            ```
+
+            ### 扩容（首次开机后在设备上执行）
+
+            ```bash
+            ls -l /dev/disk/by-partlabel/userdata
+            resize2fs /dev/disk/by-partlabel/userdata
+            ```
+
+            ### ⚠️ 前置条件
+
+            本镜像需要配合**主线内核 boot.img** 使用：
+
+            1. 先刷 `boot.img`（见另一条 workflow 的产物）
+            2. 再刷 `rootfs.img` 到 `userdata`
+            3. 首次开机务必刷新工程版 preloader，确保能自行救砖
+
+            ### ⚠️ 默认凭据
+
+            构建时设定，**首次登录后请立即修改**。详见附件 `README.txt`。
+          files: |
+            out/rootfs.img
+            out/rootfs.img.sha256
+            out/README.txt
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------
+      # 15. 汇总
+      # ---------------------------------------------------------------
+      - name: Summary
+        run: |
+          {
+            echo "## ✅ rootfs.img 构建成功"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 桌面环境 | \`${{ steps.meta.outputs.desktop }}\` |"
+            echo "| 镜像大小 | \`${{ steps.meta.outputs.img_size }} GB\` |"
+            echo "| 文件大小 | $(du -h out/rootfs.img | cut -f1) |"
+            echo "| sha256 | \`$(cut -d' ' -f1 out/rootfs.img.sha256)\` |"
+            echo "| 安装方式 | \`${PACMAN_MODE}\` |"
+            echo ""
+            echo "### 产物"
+            echo "- Actions Artifacts（30 天）: \`xaga-rootfs-${{ steps.meta.outputs.desktop }}-${{ github.run_number }}\`"
+            if [ -n "${{ steps.tag.outputs.out_tag }}" ]; then
+              echo "- Release 永久资源 tag: \`${{ steps.tag.outputs.out_tag }}\`"
+            fi
+            echo ""
+            echo "### 刷入提醒"
+            echo "1. 先刷 boot.img（另一条 workflow 的产物）"
+            echo "2. \`fastboot flash userdata rootfs.img\`"
+            echo "3. 首次开机后 \`resize2fs /dev/disk/by-partlabel/userdata\` 扩容"
+          } >> $GITHUB_STEP_SUMMARY
