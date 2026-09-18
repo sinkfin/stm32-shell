@@ -400,13 +400,103 @@ jobs:
             device-tree-compiler \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             zstd rsync \
-            android-sdk-libsparse-utils
+            mkbootimg android-sdk-libsparse-utils
 
-          if ! command -v mkbootimg >/dev/null 2>&1; then
-            echo "::warning::apt 未提供 mkbootimg，改用 pip 版本"
-            pip3 install --user --break-system-packages mkbootimg
-          fi
-          command -v mkbootimg && mkbootimg --help 2>&1 | head -3 || true
+      - name: "[boot] Set up working mkbootimg"
+        if: steps.meta.outputs.do_boot == 'true'
+        run: |
+          set -e
+
+          # ============================================================
+          # 背景：Ubuntu 的 mkbootimg 包是「上游 AOSP 脚本 + 漏打包依赖」，
+          # 直接运行会报：
+          #   ModuleNotFoundError: No module named 'gki'
+          # 因为 /usr/bin/mkbootimg 第 31 行有模块级 import：
+          #   from gki.generate_gki_certificate import generate_gki_certificate
+          # 而 gki/ 目录根本没被装进 deb（dpkg -L mkbootimg 可以证实）。
+          #
+          # 这个 gki 模块只在传 --gki_signing_key 做 GKI 签名时才真正用到，
+          # 我们打包的是 header_version=4 的普通 boot.img，不走签名路径，
+          # 所以塞一个 stub 让它 import 成功即可。
+          #
+          # 注意：pip 上没有 mkbootimg 包（PyPI 无此发行），别再走 pip。
+          # ============================================================
+
+          WORKDIR="$RUNNER_TEMP/mkbootimg-shim"
+          mkdir -p "$WORKDIR/gki"
+
+          : > "$WORKDIR/gki/__init__.py"
+          cat > "$WORKDIR/gki/generate_gki_certificate.py" <<'PYEOF'
+          """Stub 替代 AOSP 的 gki.generate_gki_certificate。
+
+          真正的实现只在 mkbootimg 收到 --gki_signing_key 时才会被调用。
+          我们不做 GKI 签名，这里只需要让模块级 import 成功即可。
+          万一真被调用，就明确报错而不是静默产生错误的镜像。
+          """
+
+
+          def generate_gki_certificate(*args, **kwargs):
+              raise NotImplementedError(
+                  "本环境未提供 GKI 签名实现；本 workflow 不需要 GKI 签名。"
+              )
+          PYEOF
+
+          # 用 shim 目录优先于系统路径，让 import gki 能解析到
+          echo "PYTHONPATH=$WORKDIR" >> $GITHUB_ENV
+
+          echo "=== 验证 mkbootimg 可用 ==="
+          export PYTHONPATH="$WORKDIR"
+          mkbootimg --help >/dev/null 2>&1 \
+            && echo "✅ mkbootimg 可用" \
+            || { echo "::error::mkbootimg 仍不可用"; mkbootimg --help; exit 1; }
+
+          echo "mkbootimg 位置: $(command -v mkbootimg)"
+          echo "python3        : $(python3 --version)"
+
+          # 记录一下顶层参数，方便后续核对
+          echo "=== --help 摘要 ==="
+          mkbootimg --help 2>&1 | grep -E "header_version|pagesize|dtb_offset" || true
+
+      - name: "[boot] Smoke-test mkbootimg (self-check)"
+        if: steps.meta.outputs.do_boot == 'true'
+        run: |
+          set -e
+          # 用两个小文件真打一次包，确认能产出合法的 v4 header。
+          # 这样如果打包器有问题，在这里就报错，而不是等十几分钟编译完才炸。
+          D="$RUNNER_TEMP/mkboot-smoke"
+          rm -rf "$D"; mkdir -p "$D"; cd "$D"
+
+          head -c 1048576 /dev/urandom > Image.gz
+          head -c 65536   /dev/urandom > ramdisk.lz4
+
+          mkbootimg \
+            --kernel Image.gz \
+            --ramdisk ramdisk.lz4 \
+            --base            "$KERNEL_BASE" \
+            --kernel_offset   "$KERNEL_OFFSET" \
+            --pagesize        "$PAGESIZE" \
+            --ramdisk_offset  "$RAMDISK_OFFSET" \
+            --tags_offset     "$TAGS_OFFSET" \
+            --dtb_offset      "$DTB_OFFSET" \
+            --header_version  "$HEADER_VERSION" \
+            --os_version      "$OS_VERSION" \
+            --os_patch_level  "$OS_PATCH_LEVEL" \
+            -o smoke.img
+
+          python3 - <<'PY'
+          import struct, sys
+          d = open('smoke.img', 'rb').read(4096)
+          assert d[:8] == b'ANDROID!', f'magic 异常: {d[:8]}'
+          ksize, rsize, osver, hsize = struct.unpack_from('<4I', d, 8)
+          hver = struct.unpack_from('<I', d, 0x28)[0]
+          print(f'  kernel_size    : {ksize}')
+          print(f'  ramdisk_size   : {rsize}')
+          print(f'  header_size    : {hsize}  (v4 应为 1584)')
+          print(f'  header_version : {hver}')
+          assert hver == 4, f'header_version 应为 4，实际 {hver}'
+          assert hsize == 1584, f'header_size 应为 1584，实际 {hsize}'
+          print('✅ mkbootimg 冒烟测试通过：可正常产出 boot v4 镜像')
+          PY
 
       - name: "[boot] Show toolchain versions"
         if: steps.meta.outputs.do_boot == 'true'
@@ -544,16 +634,46 @@ jobs:
           echo "=== boot.img 头部校验 ==="
           python3 - <<'PY'
           import struct, sys
-          d = open('out/boot.img','rb').read(4096)
-          if d[:8] != b'ANDROID!':
-              print('!! magic 异常:', d[:8]); sys.exit(1)
-          (ksize, rsize, osver, hsize, r1, hver, r2) = struct.unpack_from('<7I', d, 8)
+
+          # boot_img_hdr 布局（AOSP include/bootimg/bootimg.h）：
+          #   0x00  char     magic[8]        "ANDROID!"
+          #   0x08  uint32_t kernel_size
+          #   0x0c  uint32_t ramdisk_size
+          #   0x10  uint32_t os_version
+          #   0x14  uint32_t header_size     (v4 = 1584)
+          #   0x18  uint32_t reserved[4]     (16 字节)
+          #   0x28  uint32_t header_version  ← 注意在 0x28，不在前 7 个 uint32 里
+          #
+          # 另注：header_version >= 3 时，内核/ramdisk/tags 的加载地址
+          # 不再写进 header，而由 bootloader（xaga 上是定制 LK）自行决定。
+          # 所以 --base/--kernel_offset 等参数在 v4 下不影响加载地址，
+          # 只用于镜像内部页对齐，读不到它们是正常的、不是错误。
+          d = open('out/boot.img', 'rb').read(4096)
+
+          magic = d[0x00:0x08]
+          if magic != b'ANDROID!':
+              print('!! magic 异常:', magic); sys.exit(1)
+
+          ksize = struct.unpack_from('<I', d, 0x08)[0]
+          rsize = struct.unpack_from('<I', d, 0x0c)[0]
+          osver = struct.unpack_from('<I', d, 0x10)[0]
+          hsize = struct.unpack_from('<I', d, 0x14)[0]
+          hver  = struct.unpack_from('<I', d, 0x28)[0]
+
+          print(f'magic          : {magic.decode()}')
           print(f'kernel_size    : {ksize} ({ksize/1024/1024:.2f} MB)')
           print(f'ramdisk_size   : {rsize} ({rsize/1024:.1f} KB)')
+          print(f'header_size    : {hsize}  (v4 应为 1584)')
           print(f'header_version : {hver}')
-          if hver != 4: print('!! header_version != 4'); sys.exit(1)
-          if ksize == 0: print('!! kernel 为空'); sys.exit(1)
-          if rsize == 0: print('!! ramdisk 为空'); sys.exit(1)
+
+          if hver != 4:
+              print(f'!! header_version 应为 4，实际 {hver}'); sys.exit(1)
+          if hsize != 1584:
+              print(f'!! header_size 应为 1584，实际 {hsize}'); sys.exit(1)
+          if ksize == 0:
+              print('!! kernel 为空'); sys.exit(1)
+          if rsize == 0:
+              print('!! ramdisk 为空'); sys.exit(1)
           print('OK: boot.img 校验通过')
           PY
 
